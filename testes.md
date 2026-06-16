@@ -1,0 +1,188 @@
+# متابعة المهام — Task Dashboard (Architecture & File Reference)
+
+توثيق كامل لموديول `nofouth_team/apis/task_dashboard`: دور كل ملف وكل دالة.
+
+---
+
+## 1. الفكرة المعمارية
+
+**العقار (Property) هو محور النظام.** لأي مستخدم يُحسب **شرط واحد** بعقاراته
+المسموح بها (`_property_scope_cond`)، وكل الأقسام تفلتر به → اتساق كامل.
+
+تدفّق الطلب:
+```
+Frontend (App.vue)
+   → get_role_config()         # الكروت الظاهرة + شريط الفلتر
+   → كل كارت ينادي get_<card>_count(override_filter_type, override_filter_value)
+   → الباك يحسب نطاق SQL (resolve / <section>_filter) ويَعُدّ
+   → get_rows() عند فتح التفاصيل
+```
+
+**فئتان من الأقسام:**
+- **عقارية** (عقود/دفعات/سندات/قضايا/زيارات/وحدات/إعلانات/صيانة/إجراءات/إحصائيات):
+  النطاق = عقارات المستخدم.
+- **تعيينية** (مهام المستخدم/مهام الموظفين/طلبات العملاء): النطاق = التعيين/المسؤول،
+  مش العقار.
+
+**النمط الموحّد لكل ملف قسم:**
+`_w_*()` شروط الكروت → `CARDS` dict → `_<x>_filter()` نطاق الدور →
+`_count()` → `@whitelist get_<card>_count()` لكل كارت → `get_card_count()` موزّع →
+`get_rows()` لصفوف التفاصيل.
+
+---
+
+## 2. `role_config.py` — مصدر الحقيقة (القلب)
+
+ثوابت الأدوار + الرؤية + أنواع الفلتر + حساب النطاق + الـ endpoints.
+
+### بيانات
+| الاسم | الدور |
+|------|------|
+| `ALL_ACCESS_ROLES`, `PROPERTY_PERM_ROLES`, `OWNER_PERM_ROLES`, `TENANT_ROLES`, `MAINTENANCE_ROLES` | ثوابت أسماء الأدوار (مصدر واحد) |
+| `CARDS_VISIBILITY` | لكل كارت: الأدوار اللي **ما تشوفهوش** (`hidden_from`) |
+| `FILTER_TYPES` + `_FILTER_BY_KEY` | أنواع شريط الفلتر (العقار/المستخدم/المالك/مشرف/مسؤول/مشروع/مستأجر) |
+| `ROLE_CONFIG` | قواعد `{roles, can_use_filter_bar}` فقط — مطابقة الدور + علم فلتر الأدمن |
+| `_MAINT_OFFICER_VISIBLE` | كروت زيارات يشوفها مسؤول الصيانة بفلتر خاص |
+
+### أدوات SQL صغيرة
+| الدالة | الدور |
+|------|------|
+| `_in_list(values)` | `['a','b'] → "('a','b')"` (escaped) أو `None` |
+| `_perm_values(user, allow)` | قيم `User Permission` لنوع `allow` معيّن |
+| `_props_subquery(cond)` | `(SELECT name … UNION SELECT property_name …)` — يوحّد معرّفَي العقار |
+
+### جالبات الهوية (raw SQL لتفادي قصّ Frappe لـ `_id`)
+- `_emp_for(user)` → موظف المستخدم · `_tenant_for(user)` → مستأجره
+
+### مصادر الوصول (متعدّية/transitive للجذر)
+| الدالة | الدور |
+|------|------|
+| `_owners_for(user)` | المُلاك: own + `allow='Property Owner'` → يتبع سلسلة مالك→مستخدمه→مالك |
+| `_employees_for(user)` | الموظفون: own + متابَعين + `allow='Employee'` → يتبع السلسلة |
+| `_owners_in_sql` / `_employees_in_sql` | نفس القوائم كـ `IN`-list |
+| `_reachable_users(user)` | كل المستخدمين في سلسلة المستخدم (لفلتر "المستخدم") |
+
+### نطاق العقار
+| الدالة | الدور |
+|------|------|
+| `_property_scope_cond(user)` | **القلب**: شرط `tabProperty` بكل عقارات المستخدم (OR لكل المصادر)؛ `None` لو لا وصول. المستأجر مستثنى |
+| `_property_scope_member(field, user)` | `"field IN (subq)"` (بدون AND) أو None |
+| `_property_scope_in(field, user)` | `"AND field IN (subq)"` أو `"AND 1=0"` |
+| `_properties_for(user)` | قائمة أسماء عقارات المستخدم (لخيارات الفلتر) |
+
+### الفلتر → مجموعة عقارات
+| الدالة | الدور |
+|------|------|
+| `_filter_property_cond(ftype, value)` | شرط `tabProperty` لاختيار فلتر؛ "user"/"employee" → عقارات ذلك الشخص |
+| `_filter_section_sql(field, ftype, value)` | `" AND field IN (subq)"` للأقسام ذات حقل العقار المباشر |
+| `_filter_contract_sql(ftype, value)` | `"AND rc.property IN (subq)"`؛ المستأجر خاص (`rc.tenant_name`) |
+
+### الرؤية والـ resolve
+| الدالة | الدور |
+|------|------|
+| `_compute_hidden_sections(user_roles)` | الكروت المخفية من `CARDS_VISIBILITY` (+ منطق مسؤول الصيانة) |
+| `is_admin_filter_user(roles)` | هل المستخدم أدمن (فلتر كامل)؟ |
+| `scoped_filter_keys(user)` | أنواع الفلتر المتاحة لغير-الأدمن (مقصورة على نطاقه) |
+| `_base_scope(user, roles, matched)` | نطاق العقود الأساسي: أدمن→"" · مستأجر→عقده · غيرهم→عقاراته |
+| `resolve(override_type, override_value)` | **نقطة الدخول**: يرجّع `{sql, hidden_sections, can_use_filter_bar}` |
+
+### Endpoints (للفرونت)
+- `get_role_config()` → الكروت المخفية + أنواع الفلتر (كامل للأدمن، مقصور لغيره)
+- `get_filter_options(filter_type, search)` → بحث قيم الفلتر، **مقصور على كيانات المستخدم** لغير-الأدمن
+
+---
+
+## 3. `follow.py` — المتابعة والعرض المدمج
+
+| الدالة | الدور |
+|------|------|
+| `get_watchable_users()` *(endpoint)* | المستخدمون اللي يقدر يتابعهم الحالي (`allow='User'`) — لشريط المتابعة |
+| `can_watch(watcher, target)` | هل watcher له صلاحية متابعة target؟ |
+| `get_all_users(user)` | المستخدم + كل المتابَعين **متعدّيًا** (A→B→C، آمن من الدوائر) |
+| `get_all_employees(user)` | موظفو `get_all_users` |
+| `get_all_owners(user)` | مُلاك `get_all_users` |
+| `in_sql(values, escape)` | `IN`-list آمن |
+
+---
+
+## 4. أقسام العقود والمالية
+
+### `contracts.py` — متابعة العقود
+كروت: `ending_soon`, `ended`, `undocumented`, `draft`, `auto_renewal`.
+- `_where_*()` شروط كل كارت على `tabRent Contract`.
+- `_count`, `_card` → يطبّقوا `resolve()["sql"]` (نطاق العقار).
+- `get_<card>_count` (×5) · `get_card_count` · `get_rows`.
+
+### `actions.py` — إجراءات على العقود
+كروت: `rent_raise`, `non_renewal`, `cancel_contract`, `unit_receive`, `unit_deliver`.
+- `_get_actions_context()` → نطاق العقار عبر العقد (`EXISTS … rc.name=t.rent_contract`) باستخدام `_property_scope_in`/`_filter_contract_sql`.
+- `_where_*()`, `CARDS`, `_card_response`, `_ctx` · `get_<card>_count` (×5) · `get_card_count` · `get_rows`.
+
+### `payments.py` — التحصيل والمتأخرين
+كروت: `due_30`, `overdue_no_46`, `overdue_with_46`.
+- `_contract_filter(cfg)` → يلفّ `resolve` sql في `EXISTS` على `tabRent Contract` عبر `tdp.rent_contract`.
+- `_where_*()` شروط على `tabTenant Due Payments` (مع منطق إجراء 46) · `_count` · endpoints + `get_rows`.
+
+### `receipts.py` — سندات القبض
+كروت: `draft_receipt`, `pending_finance`.
+- `_receipt_filter(cfg)` → نطاق `resolve` على `tabTenant Payment Receipt` · `_where_*` · `_count` · endpoints + `get_rows`.
+
+---
+
+## 5. الأقسام العقارية الأخرى
+
+### `cases.py` — قائمة القضايا
+كروت: `cases_draft`, `cases_under_study`, `cases_pending_supervisor`, `cases_in_progress`.
+- `_cases_filter()` → نطاق العقار عبر العقد (`c.rent_contract IN (… rc.property …)`).
+
+### `visits.py` — قائمة الزيارات
+كروت: `visits_periodic`, `visits_elevators`, `visits_civil_defense`.
+- `_visits_filter()` → `v.property IN (نطاق العقار)`.
+
+### `units.py` — قائمة الوحدات
+كروت: `units_under_construction`, `units_vacant`, `units_under_maintenance`, `units_vacant_unlisted`.
+- `_units_filter()` → `u.property IN (نطاق العقار)` + مسارات الصيانة الخاصة (مشرف صيانة يشوف الكل، مسؤول صيانة بتذاكره).
+
+### `advertisements.py` — قائمة الإعلانات
+كروت: `ads_active`, `ads_need_action`.
+- `_ads_filter()` → `a.property IN (نطاق العقار)`.
+
+### `maintenance.py` — قائمة أعمال الصيانة
+كروت: `quote_pending`, `maint_supervisor_station`, `property_approval`, `in_progress_maint`, `finance_pending_maint`, `preventive_upcoming`.
+- `_maint_filter()` → `pmt.property IN (نطاق العقار)` + مسؤول الصيانة (`pmt.maintenace_officer`) + المستأجر ("بانتظار المستأجر" فقط).
+- `_hidden_from_visibility`, `_w_quote_for`, `_w_*`, `_resolve_where`, `_count` · endpoints.
+
+### `summary_stats.py` — الإحصائيات
+- `_units_sql()` → نطاق الوحدات (عقاري). `get_summary()` *(endpoint)* → أرقام مجمّعة (عقود/وحدات) عبر `resolve` + `_units_sql`.
+
+---
+
+## 6. الأقسام التعيينية (مش عقارية)
+
+### `tasks.py` — مهام المستخدم
+كروت: `tasks_in_progress`, `tasks_overdue`, `tasks_pending_supervisor`.
+- مهام المستخدم نفسه (`custom_responsible_user`) — **لا تتأثر بأي فلتر** (filter-immune).
+
+### `employee_tasks.py` — مهام الموظفين
+كروت: `emp_in_progress`, `emp_overdue`, `emp_pending_supervisor`.
+- `_tasks_scope_for_user(user)` → `custom_responsible_user` (assign-to) OR `custom_reports_to` (المشرف).
+- `_emp_tasks_filter_clause` / `_emp_tasks_filter` → يستجيب لفلتر **المستخدم/الموظف/المشروع** (يعيد إنتاج نطاق الشخص المختار).
+
+### `customer_requests.py` — طلبات العملاء
+كروت: `customer_requests`, `rental_requests`, `pending_supervisor_cr`.
+- handler-based: `cr.responsible_employee` / `مشرف_العقار` / `assign_to` / `maintenace_officer`.
+- `_cr_user_clause(target)` / `_cr_filter_clause` → يستجيب لفلتر **المستخدم** (الطلبات اللي الشخص يعالجها).
+
+---
+
+## 7. `popup_data.py` — تفاصيل الصفوف
+- `get_popup_data(doctype, filters, start)` *(endpoint)* → جلب عام لصفوف دوكتايب عبر `frappe.get_list` (يطبّق صلاحيات Frappe الأصلية).
+
+---
+
+## 8. ملاحظات أمان واتساق
+1. كل قيمة على SQL تمرّ بـ `frappe.db.escape`.
+2. غير-الأدمن: الفلتر يُضاف بـ **AND** على نطاقه → تضييق فقط، مستحيل توسيع.
+3. خيارات الفلتر لغير-الأدمن مقصورة على كياناته.
+4. الصلاحيات **متعدّية للجذر** (مستخدمين/مُلاك/موظفين) مع حماية من الدوائر.
+5. المستأجر دايمًا scoped بعقده (مش بالعقار) — حماية خصوصية.
